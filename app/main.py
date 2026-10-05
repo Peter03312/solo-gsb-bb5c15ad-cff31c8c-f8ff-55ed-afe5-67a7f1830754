@@ -3,23 +3,25 @@ from __future__ import annotations
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import Session
 
+from .clearance import minimum_clearance
 from .collision import Zone, check_path, initial_collision
 from .database import Base, engine, get_db
 from .gcode import GCodeError, parse_gcode
 from .geometry import GeometryError, normalize_polygon, validate_z_range
 from . import models
 from .models import Report, ZoneVersion
-from .schemas import (ReviewRequest, ReviewResponse, ZoneCreate, ZoneDetailOut,
+from .schemas import (MinClearanceOut, ReviewRequest, ZoneCreate, ZoneDetailOut,
                       ZoneOut, ZoneVersionCreate, ZoneVersionOut)
 
 app = FastAPI(
     title="数控刀路禁入区审查服务",
-    version="1.0.0",
+    version="1.1.0",
     description="登记毫米制二维多边形禁区（含闭合 Z 高度范围、不可变版本），"
-                "对 G-code 刀路做连续碰撞审查并出具不可变报告。",
+                "对 G-code 刀路做连续碰撞审查并出具不可变报告；"
+                "可选计算全程最小水平净间隙（include_min_clearance）。",
 )
 
 
@@ -27,6 +29,25 @@ app = FastAPI(
 def on_startup() -> None:
     # 容器内由应用直接完成数据库初始化（表结构创建）
     Base.metadata.create_all(bind=engine)
+    # 轻量补列：旧库（可选最小净间隙功能上线前）自动补齐新列，不影响既有数据
+    _ensure_report_columns()
+
+
+def _ensure_report_columns() -> None:
+    inspector = inspect(engine)
+    if "reports" not in inspector.get_table_names():
+        return
+    existing = {c["name"] for c in inspector.get_columns("reports")}
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        if "min_clearance_enabled" not in existing:
+            default = "0" if dialect == "sqlite" else "false"
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN min_clearance_enabled "
+                f"BOOLEAN NOT NULL DEFAULT {default}"))
+        if "min_clearance" not in existing:
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN min_clearance JSON"))
 
 
 @app.exception_handler(GeometryError)
@@ -159,10 +180,17 @@ def _load_zones(db: Session, refs) -> tuple[list[Zone], dict[str, int], dict[int
     return zones, used, version_ids
 
 
-@app.post("/reviews", response_model=ReviewResponse,
-          summary="提交刀路审查并生成不可变报告")
+@app.post("/reviews",
+          summary="提交刀路审查并生成不可变报告",
+          description="碰撞结论始终返回。请求体 `include_min_clearance=true` 时，"
+                      "额外计算并在响应 `min_clearance` 中返回全程最小水平净间隙"
+                      "（毫米：路径到填充多边形最小距离减刀半径，仅计刀尖 Z 位于"
+                      "禁区闭合高度范围的部分；直线/圆弧/整圆连续覆盖，可为负，"
+                      "接触为 0；全程不在高度内为 null；无运动段按初始刀位、"
+                      "line_no=null）。该字段随报告固化，且不影响首个碰撞结论；"
+                      "未启用时请求与报告均不含该字段。")
 def review(payload: ReviewRequest,
-           db: Session = Depends(get_db)) -> ReviewResponse:
+           db: Session = Depends(get_db)) -> dict:
     if payload.tool_radius < 0:
         raise HTTPException(status_code=422, detail="刀具半径不得为负")
 
@@ -207,6 +235,21 @@ def review(payload: ReviewRequest,
 
     has_coll = zone_no is not None
 
+    # 可选：全程最小水平净间隙。仅在请求启用时计算并随报告固化；
+    # 结果不影响既有首个碰撞结论与行号。
+    min_clr_payload = None
+    if payload.include_min_clearance:
+        mc = minimum_clearance(parsed.motions, zones,
+                               tuple(payload.start),  # type: ignore[arg-type]
+                               payload.tool_radius)
+        if mc is not None:
+            min_clr_payload = MinClearanceOut(
+                min_clearance_mm=mc.min_clearance_mm,
+                line_no=mc.line_no,
+                tip_position_mm=mc.tip_position_mm,
+                zone_no=mc.zone_no,
+            ).model_dump()
+
     if has_coll:
         conclusion = "collision"
         message = (f"发现碰撞：G-code 第 {line_no} 行与禁区编号 {zone_no} 冲突") \
@@ -223,16 +266,36 @@ def review(payload: ReviewRequest,
         collision_line_no=line_no,
         collision_zone_no=zone_no,
         conclusion=conclusion,
+        min_clearance_enabled=payload.include_min_clearance,
+        min_clearance=min_clr_payload,
     )
     db.add(report)
     db.commit()
     db.refresh(report)
 
-    return ReviewResponse(
-        report_id=report.id, used_zone_versions=used_versions,
-        input_summary=summary, has_collision=has_coll,
-        collision_line_no=line_no, collision_zone_no=zone_no,
-        conclusion=conclusion, message=message)
+    body: dict = {
+        "report_id": report.id,
+        "used_zone_versions": used_versions,
+        "input_summary": summary,
+        "has_collision": has_coll,
+        "collision_line_no": line_no,
+        "collision_zone_no": zone_no,
+        "conclusion": conclusion,
+        "message": message,
+    }
+    # 仅启用该可选项的请求/报告返回该字段（旧请求与既有报告保持兼容）
+    if payload.include_min_clearance:
+        body["min_clearance"] = min_clr_payload
+    return body
+
+
+def _report_message(report: Report) -> str:
+    if report.has_collision and report.collision_line_no is not None:
+        return (f"发现碰撞：G-code 第 {report.collision_line_no} 行与禁区编号 "
+                f"{report.collision_zone_no} 冲突")
+    if report.has_collision:
+        return "初始刀位点位于禁区范围内"
+    return "刀路与全部指定禁区版本无碰撞"
 
 
 @app.get("/reports/{report_id}", summary="查询不可变审查报告")
@@ -240,7 +303,7 @@ def get_report(report_id: int, db: Session = Depends(get_db)) -> dict:
     report = db.get(Report, report_id)
     if report is None:
         raise HTTPException(status_code=404, detail="报告不存在")
-    return {
+    body = {
         "report_id": report.id,
         "created_at": report.created_at,
         "used_zone_versions": report.zone_versions,
@@ -249,13 +312,13 @@ def get_report(report_id: int, db: Session = Depends(get_db)) -> dict:
         "collision_line_no": report.collision_line_no,
         "collision_zone_no": report.collision_zone_no,
         "conclusion": report.conclusion,
-        "message": (
-            f"发现碰撞：G-code 第 {report.collision_line_no} 行与禁区编号 "
-            f"{report.collision_zone_no} 冲突"
-            if report.has_collision and report.collision_line_no is not None
-            else ("初始刀位点位于禁区范围内" if report.has_collision
-                  else "刀路与全部指定禁区版本无碰撞")),
+        "message": _report_message(report),
     }
+    # 仅当报告生成时启用了最小净间隙计算，才固化回传该字段；
+    # 旧报告（未启用）永不出现该字段，查询结果与生成时一致。
+    if getattr(report, "min_clearance_enabled", False):
+        body["min_clearance"] = report.min_clearance
+    return body
 
 
 @app.get("/health", summary="健康检查")

@@ -205,20 +205,29 @@ def angle_on_subarc(theta: float, theta0: float, sweep: float) -> bool:
     return d <= -sweep + EPS
 
 
-def arc_segment_distance(center: XY, radius: float, theta0: float, sweep: float,
-                         a: XY, b: XY) -> float:
-    """圆弧（含整圆）与线段 ab 之间的最小距离。
+def arc_segment_distance_candidates(center: XY, radius: float, theta0: float,
+                                    sweep: float, a: XY, b: XY
+                                    ) -> list[tuple[float, float]]:
+    """圆弧（含整圆）到线段 ab 的最近距离候选：返回 [(s∈[0,1], 距离), ...]。
 
-    候选包括：
-    1) 弧与线段相交（距离 0）；
+    s 为弧进度（theta = theta0 + s*sweep）。候选集合与
+    ``arc_segment_distance`` 完全一致：
+    1) 弧与线段相交（距离 0），返回全部相交进度；
     2) 弧端点到线段的垂足距离；
-    3) 圆心到线段的垂足落在圆上且该点位于弧上（相切/近圆侧）；
-    4) 线段端点到圆的径向最近点且位于弧上（线段端点在圆内时取 0）。
+    3) 圆心到线段垂足在圆上的对应弧点（相切/近圆侧）；
+    4) 线段端点到圆的径向最近弧点（端点在圆内时距离为半径差）。
     """
     p0 = add(center, (radius * math.cos(theta0), radius * math.sin(theta0)))
     end = theta0 + sweep
     p1 = add(center, (radius * math.cos(end), radius * math.sin(end)))
-    best = min(point_segment_distance(p0, a, b), point_segment_distance(p1, a, b))
+    cands: list[tuple[float, float]] = [
+        (0.0, point_segment_distance(p0, a, b)),
+        (1.0, point_segment_distance(p1, a, b)),
+    ]
+
+    def s_of(theta: float) -> float:
+        s = (theta - theta0) / sweep
+        return max(0.0, min(1.0, s))
 
     # 圆心到线段的垂足
     ab = sub(b, a)
@@ -232,8 +241,9 @@ def arc_segment_distance(center: XY, radius: float, theta0: float, sweep: float,
             nv = norm(v)
             if nv > EPS:
                 q = add(center, mul(v, radius / nv))
-                if angle_on_subarc(math.atan2(v[1], v[0]), theta0, sweep):
-                    best = min(best, dist(q, foot))
+                theta = math.atan2(v[1], v[0])
+                if angle_on_subarc(theta, theta0, sweep):
+                    cands.append((s_of(theta), dist(q, foot)))
         # 线段端点到圆最近点
         for ep in (a, b):
             v = sub(ep, center)
@@ -242,11 +252,14 @@ def arc_segment_distance(center: XY, radius: float, theta0: float, sweep: float,
                 continue
             theta = math.atan2(v[1], v[0])
             if angle_on_subarc(theta, theta0, sweep):
-                radial = abs(d - radius)
-                best = min(best, radial)
+                q = add(center, (radius * math.cos(theta),
+                                 radius * math.sin(theta)))
+                # 端点在圆内：径向最近点（距离 |d-r|，可能为 0）；
+                # 端点在圆外：该径向点仍是弧到该端点的最近点候选
+                # （圆包围多边形时，到凸顶点的最近弧点即径向点）。
+                cands.append((s_of(theta), dist(q, ep)))
 
     # 弧与线段是否相交（解二次方程）
-    # |center - (a + t ab)|^2 = r^2, t in [0,1], 且交点角在弧上
     A = dot(ab, ab)
     if A > EPS * EPS:
         ac = sub(a, center)
@@ -256,13 +269,24 @@ def arc_segment_distance(center: XY, radius: float, theta0: float, sweep: float,
         if disc >= -EPS:
             disc = max(0.0, disc)
             sq = math.sqrt(disc)
+            hits: list[float] = []
             for t in ((-B - sq) / (2.0 * A), (-B + sq) / (2.0 * A)):
                 if -EPS <= t <= 1.0 + EPS:
                     q = add(a, mul(ab, max(0.0, min(1.0, t))))
                     theta = math.atan2(q[1] - center[1], q[0] - center[0])
                     if angle_on_subarc(theta, theta0, sweep):
-                        return 0.0
-    return best
+                        hits.append(s_of(theta))
+            if hits:
+                return [(s, 0.0) for s in hits]
+    return cands
+
+
+def arc_segment_distance(center: XY, radius: float, theta0: float, sweep: float,
+                         a: XY, b: XY) -> float:
+    """圆弧（含整圆）与线段 ab 之间的最小距离。"""
+    return min(d for _, d in
+               arc_segment_distance_candidates(center, radius, theta0,
+                                               sweep, a, b))
 
 
 def subarc_hits(center: XY, radius: float, theta0: float, sweep: float,

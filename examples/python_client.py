@@ -75,6 +75,32 @@ def main() -> None:
     print("immutable old report:", old_report["used_zone_versions"],
           old_report["has_collision"])
 
+    # 6. 可选：启用全程最小水平净间隙
+    #    路径 y=11 距禁区 y=10 边 1mm，刀半径 0.5 => 最小净间隙 0.5mm
+    mc = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 11.0, 0.0],
+        "tool_radius": 0.5,
+        "gcode": "G1 X15 Y11 Z0",
+        "include_min_clearance": True,
+    })
+    mc.raise_for_status()
+    body = mc.json()
+    print("min clearance:", body["min_clearance"])
+    # 结果随报告固化，GET 查询一致
+    assert c.get(f"/reports/{body['report_id']}").json()["min_clearance"] \
+        == body["min_clearance"]
+
+    # 7. 未启用（省略 include_min_clearance）：响应与报告均无该字段
+    plain = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 50.0, 0.0],
+        "tool_radius": 0.0,
+        "gcode": "G1 X15 Y50 Z0",
+    }).json()
+    assert "min_clearance" not in plain
+    print("backward compatible: no min_clearance key when disabled")
+
 
 if __name__ == "__main__":
     main()

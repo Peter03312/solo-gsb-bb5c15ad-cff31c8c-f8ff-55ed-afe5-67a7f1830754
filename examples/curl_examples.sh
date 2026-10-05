@@ -73,3 +73,46 @@ curl -s -X POST "$BASE/reviews" \
 
 echo "== 8) 旧报告内容不随后续禁区更新改变 =="
 curl -s "$BASE/reports/1"; echo
+
+echo "== 9) 可选：启用全程最小水平净间隙（距边 1mm，刀半径 0.5 => 净间隙 0.5mm） =="
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 11, 0],
+        "tool_radius": 0.5,
+        "gcode": "G1 X15 Y11 Z0",
+        "include_min_clearance": true
+      }'; echo
+
+echo "== 10) 边界接触 => 最小净间隙为 0 =="
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 10.5, 0],
+        "tool_radius": 0.5,
+        "gcode": "G1 X15 Y10.5 Z0",
+        "include_min_clearance": true
+      }'; echo
+
+echo "== 11) 圆弧整圆 + 启用净间隙（入口在弧上） =="
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-50, -50, 0],
+        "tool_radius": 0.0,
+        "gcode": "G90 G21 G17\nG1 X10 Y0 Z0\nG3 X10 Y0 I-10 J0",
+        "include_min_clearance": true
+      }'; echo
+
+echo "== 12) 未启用时响应与 GET 报告均不含 min_clearance 字段（向后兼容） =="
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 50, 0],
+        "tool_radius": 0.0,
+        "gcode": "G1 X15 Y50 Z0"
+      }' | python3 -c 'import json,sys; b=json.load(sys.stdin); print("has min_clearance key:", "min_clearance" in b)'

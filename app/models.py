@@ -67,3 +67,10 @@ class Report(Base):
     collision_line_no = Column(Integer, nullable=True)
     collision_zone_no = Column(Integer, nullable=True)
     conclusion = Column(Text, nullable=False)
+
+    # 可选：全程最小水平净间隙（随报告固化）
+    # min_clearance_enabled 为本报告是否启用该计算；
+    # min_clearance 为结果 JSON（全程不在任何禁区高度内时为 None）。
+    min_clearance_enabled = Column(Boolean, nullable=False, default=False,
+                                   server_default="0")
+    min_clearance = Column(JSON, nullable=True)
