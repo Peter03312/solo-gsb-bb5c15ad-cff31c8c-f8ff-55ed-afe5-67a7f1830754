@@ -265,6 +265,129 @@ def arc_segment_distance(center: XY, radius: float, theta0: float, sweep: float,
     return best
 
 
+def arc_segment_closest(center: XY, radius: float, theta0: float, sweep: float,
+                        a: XY, b: XY) -> list[tuple[float, float]]:
+    """圆弧（含整圆）与线段 ab 之间取得最小距离的候选点。
+
+    返回 [(distance, theta), ...]：distance 为弧上角度 theta 处的点到线段的
+    距离（theta 保证位于弧上，含端点）。距离平方极值只可能出现在：
+    1) 弧端点到线段的垂足；
+    2) 圆心到线段垂足方向的圆上点（该点位于弧上）；
+    3) 线段端点径向方向的圆上点（该点位于弧上）；
+    4) 弧与线段的交点（距离 0）。
+    收集全部候选交由调用方按距离/进度比较，可保证不漏掉最小值。
+    """
+    cands: list[tuple[float, float]] = []
+
+    def consider(d: float, theta: float) -> None:
+        cands.append((max(0.0, d), theta))
+
+    end = theta0 + sweep
+    p0 = add(center, (radius * math.cos(theta0), radius * math.sin(theta0)))
+    p1 = add(center, (radius * math.cos(end), radius * math.sin(end)))
+    # 弧端点（整圆时 p1 与 p0 同点，调用方按进度 s 取较小者）
+    consider(point_segment_distance(p0, a, b), theta0)
+    consider(point_segment_distance(p1, a, b), end)
+
+    ab = sub(b, a)
+    length2 = dot(ab, ab)
+    if length2 <= EPS * EPS:
+        # 退化边（点）：径向最近点
+        v = sub(a, center)
+        nv = norm(v)
+        if nv > EPS and angle_on_subarc(math.atan2(v[1], v[0]), theta0, sweep):
+            consider(abs(nv - radius), math.atan2(v[1], v[0]))
+        elif nv <= EPS:
+            consider(radius, theta0)
+        return cands
+
+    # 圆心到线段的垂足
+    tc = dot(sub(center, a), ab) / length2
+    if -EPS <= tc <= 1.0 + EPS:
+        foot = add(a, mul(ab, max(0.0, min(1.0, tc))))
+        v = sub(foot, center)
+        nv = norm(v)
+        if nv > EPS:
+            theta = math.atan2(v[1], v[0])
+            if angle_on_subarc(theta, theta0, sweep):
+                consider(abs(nv - radius), theta)
+        else:
+            consider(radius, theta0)
+
+    # 线段端点到圆的径向最近点（端点在圆内时径向差为其到圆距离）
+    for ep in (a, b):
+        v = sub(ep, center)
+        nv = norm(v)
+        if nv <= EPS:
+            consider(radius, theta0)
+            continue
+        theta = math.atan2(v[1], v[0])
+        if angle_on_subarc(theta, theta0, sweep):
+            consider(abs(nv - radius), theta)
+
+    # 弧与线段相交 => 距离 0（解 |a + t ab - center|² = r²）
+    A = dot(ab, ab)
+    ac = sub(a, center)
+    B = 2.0 * dot(ac, ab)
+    C = dot(ac, ac) - radius * radius
+    disc = B * B - 4.0 * A * C
+    if disc >= -EPS:
+        sq = math.sqrt(max(0.0, disc))
+        for t in ((-B - sq) / (2.0 * A), (-B + sq) / (2.0 * A)):
+            if -EPS <= t <= 1.0 + EPS:
+                q = add(a, mul(ab, max(0.0, min(1.0, t))))
+                w = sub(q, center)
+                if norm(w) > EPS:
+                    theta = math.atan2(w[1], w[0])
+                    if angle_on_subarc(theta, theta0, sweep):
+                        consider(0.0, theta)
+    return cands
+
+
+def arc_progress_of_angle(theta: float, theta0: float, sweep: float) -> float:
+    """弧上角度 theta 对应的进度 s∈[0,1]（theta 必须位于弧上）。"""
+    total = abs(sweep)
+    if total <= EPS:
+        return 0.0
+    if sweep >= 0.0:
+        d = (theta - theta0) % (2.0 * math.pi)
+    else:
+        d = (theta0 - theta) % (2.0 * math.pi)
+    return max(0.0, min(1.0, d / total))
+
+
+def arc_polygon_closest(center: XY, radius: float, theta0: float, sweep: float,
+                        poly: Sequence[XY]) -> tuple[float, float]:
+    """圆弧到填充多边形的最小距离及取得它的弧上进度 s∈[0,1]。
+
+    距离 0（穿入内部/与边界接触，含数值接触容差）时，进度取弧上最早点；
+    正距离情形由弧端点到多边形距离与各边弧-边候选的解析极值比较得到。
+    """
+    if subarc_hits(center, radius, theta0, sweep, poly, 0.0):
+        return 0.0, earliest_arc_hit(center, radius, theta0, sweep, poly, 0.0)
+
+    best_d = math.inf
+    best_s = 1.0
+
+    def track(d: float, s: float) -> None:
+        nonlocal best_d, best_s
+        if d < best_d - EPS or (abs(d - best_d) <= EPS and s < best_s):
+            best_d, best_s = d, s
+
+    # 弧端点到填充多边形
+    for theta in (theta0, theta0 + sweep):
+        p = add(center, (radius * math.cos(theta), radius * math.sin(theta)))
+        track(point_polygon_distance(p, poly),
+              arc_progress_of_angle(theta, theta0, sweep))
+
+    n = len(poly)
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        for d, theta in arc_segment_closest(center, radius, theta0, sweep, a, b):
+            track(d, arc_progress_of_angle(theta, theta0, sweep))
+    return best_d, best_s
+
+
 def subarc_hits(center: XY, radius: float, theta0: float, sweep: float,
                 poly: Sequence[XY], tool_r: float) -> bool:
     """子弧是否与“多边形向外膨胀 tool_r 的区域”相交（含边界接触）。"""

@@ -9,6 +9,11 @@
 “运动点到边距离 ≤ 刀半径”的二次不等式，精确求解参数 t 区间，
 再与 Z 高度区间求交，取全程最早 t。
 圆弧运动：弧-边距离精确求值 + 子弧二分定位首个碰撞进度。
+
+可选全程最小水平净间隙（minimum_clearance）：
+净间隙 = 连续 XY 路径到填充多边形最小距离 − 刀具半径，
+同样只在刀尖 Z 处于禁区闭合高度范围的部分上统计；
+直线按分段二次函数精确求极值，圆弧按弧-边候选角解析求值。
 """
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ from dataclasses import dataclass
 from .geometry import (
     EPS, CONTACT_EPS, XY,
     cross, dist, point_in_polygon, point_polygon_distance,
-    earliest_arc_hit, subarc_hits,
+    earliest_arc_hit, subarc_hits, arc_polygon_closest,
 )
 from .gcode import Motion
 
@@ -69,7 +74,8 @@ def _intersect(iv1: list[tuple[float, float]],
             i += 1
         else:
             j += 1
-    return out
+    # 交集可能因输入未夹断而略超出 [0,1]，统一夹回并合并相接区间
+    return _merge(out)
 
 
 def _solve_quad_le(aa: float, bb: float, cc: float,
@@ -113,9 +119,9 @@ def _z_window(m: Motion, zone: Zone) -> list[tuple[float, float]]:
     lo, hi = sorted((t_lo, t_hi))
     lo = max(0.0, lo)
     hi = min(1.0, hi)
-    # 闭合区间：端点含边界
+    # 闭合区间：端点含边界（z 全程在范围内时直接覆盖整段）
     if lo <= hi + EPS:
-        return [(lo, hi)]
+        return [(max(0.0, lo), min(1.0, hi))]
     return []
 
 
@@ -224,6 +230,38 @@ def _line_inside_intervals(p0: XY, p1: XY,
     return _merge(result)
 
 
+def _segment_overlap_events(p0: XY, p1: XY,
+                            poly: list[XY]) -> list[tuple[float, float]]:
+    """运动线段与多边形边共线重合的参数区间（含重合端点）。
+
+    这类“贴边”路径的中点不在任何穿边事件上，通用内外采样会漏掉，
+    需显式按一维参数区间收集。
+    """
+    d = (p1[0] - p0[0], p1[1] - p0[1])
+    d2 = dot2(d, d)
+    if d2 <= EPS * EPS:
+        return [(0.0, 0.0)] if point_in_polygon(p0, poly) else []
+    out: list[tuple[float, float]] = []
+    n = len(poly)
+    for i in range(n):
+        a, b = poly[i], poly[(i + 1) % n]
+        # p0->a 与 d 共线？
+        if abs(cross((a[0] - p0[0], a[1] - p0[1]), d)) > EPS:
+            continue
+        # 边方向与运动方向平行
+        ab = (b[0] - a[0], b[1] - a[1])
+        if abs(cross(ab, d)) > EPS:
+            continue
+        ts = []
+        for e in (a, b):
+            t = ((e[0] - p0[0]) * d[0] + (e[1] - p0[1]) * d[1]) / d2
+            if -EPS <= t <= 1.0 + EPS:
+                ts.append(max(0.0, min(1.0, t)))
+        if ts:
+            out.append((min(ts), max(ts)))
+    return _merge(out)
+
+
 def _vertex_passthrough_events(p0: XY, p1: XY,
                                poly: list[XY]) -> list[tuple[float, float]]:
     """运动路径恰好经过多边形顶点的参数点（顶点属于多边形，必为碰撞点）。
@@ -325,3 +363,246 @@ def initial_collision(pos: tuple[float, float, float],
             if point_polygon_distance((x, y), zone.polygon) <= tool_radius + CONTACT_EPS:
                 return zone.zone_no
     return None
+
+
+# ---------- 全程最小水平净间隙 ----------
+#
+# 净间隙 = 连续 XY 路径到填充多边形的最小距离 − 刀具半径。
+# 仅统计刀尖 Z 位于该禁区闭合高度范围内的那部分运动：
+# - 路径点在多边形外：距离为到最近边/顶点的正距离，距离恰等于刀半径时
+#   刀具外沿刚好碰到边界（边界接触），净间隙为 0；
+# - 路径点在多边形内部或边界上：到填充多边形的距离为 0，净间隙为 -刀半径（负）。
+
+@dataclass(frozen=True)
+class ClearancePoint:
+    net: float                 # 最小净间隙（mm，可为负）
+    line_no: int | None        # 原行号；无运动段时为 None
+    order: int                 # 运动段序号（无运动段为 0）
+    progress: float            # 段内进度（直线 t，圆弧 s）；无运动段为 0
+    zone_no: int
+    point: tuple[float, float, float]  # 取得最小值时的刀尖坐标 (x, y, z)（mm）
+
+
+def _z_at(m: Motion, t: float) -> float:
+    return m.start[2] + (m.end[2] - m.start[2]) * t
+
+
+def _snap_net(raw_distance: float, tool_r: float) -> float:
+    """距离（mm）换算净间隙：distance - tool_r；接触容差内对齐为 0。"""
+    d = 0.0 if raw_distance <= CONTACT_EPS else raw_distance
+    net = d - tool_r
+    if abs(net) <= CONTACT_EPS:
+        return 0.0
+    return net
+
+
+def _clearance_better(cp: ClearancePoint, best: ClearancePoint | None) -> bool:
+    """等值（接触容差内）时：运动顺序、段内进度、禁区编号。"""
+    if best is None:
+        return True
+    if cp.net < best.net - CONTACT_EPS:
+        return True
+    if cp.net > best.net + CONTACT_EPS:
+        return False
+    if cp.order != best.order:
+        return cp.order < best.order
+    if abs(cp.progress - best.progress) > EPS:
+        return cp.progress < best.progress
+    return cp.zone_no < best.zone_no
+
+
+def _line_edge_closest(p0: XY, p1: XY, a: XY, b: XY,
+                       window: list[tuple[float, float]]
+                       ) -> tuple[float, float] | None:
+    """运动线段 p0-p1（参数 t）在 window（t 区间）内到固定边 a-b 的最小原始距离及 t。
+
+    把 [0,1] 按“运动点在边无限线上的投影参数 s 是否落在 [0,1]”切成若干区间：
+    - 垂足段内：距离平方是关于 t 的二次式，取凸二次顶点 + 区间端点；
+    - 垂足段外：距离由近端点决定（|P-a|² 或 |P-b|²），同样取顶点 + 端点。
+    逐区间求极值后再与 window 求交，保证不遗漏 Z 窗口边界处的最小值。
+    """
+    d = (p1[0] - p0[0], p1[1] - p0[1])
+    ab = (b[0] - a[0], b[1] - a[1])
+    length2 = ab[0] * ab[0] + ab[1] * ab[1]
+
+    # 各分段：(t_lo, t_hi, 该段距离平方二次式系数 q2 t² + q1 t + q0)
+    pieces: list[tuple[float, float, float, float, float]] = []
+
+    if length2 <= EPS * EPS:
+        # 退化边：按点 a 处理
+        dx, dy = p0[0] - a[0], p0[1] - a[1]
+        pieces.append((0.0, 1.0, dot2(d, d),
+                       2.0 * (d[0] * dx + d[1] * dy), dx * dx + dy * dy))
+    else:
+        ap = (p0[0] - a[0], p0[1] - a[1])
+        s0 = (ab[0] * ap[0] + ab[1] * ap[1]) / length2
+        sd = (ab[0] * d[0] + ab[1] * d[1]) / length2
+
+        if abs(sd) <= EPS:
+            # 投影位置恒定
+            if 0.0 - EPS <= s0 <= 1.0 + EPS:
+                w0 = (ap[0] - s0 * ab[0], ap[1] - s0 * ab[1])
+                wd = (d[0] - sd * ab[0], d[1] - sd * ab[1])
+                pieces.append((0.0, 1.0, dot2(wd, wd),
+                               2.0 * (w0[0] * wd[0] + w0[1] * wd[1]),
+                               dot2(w0, w0)))
+            else:
+                e = a if s0 < 0.0 else b
+                ex, ey = p0[0] - e[0], p0[1] - e[1]
+                pieces.append((0.0, 1.0, dot2(d, d),
+                               2.0 * (d[0] * ex + d[1] * ey), ex * ex + ey * ey))
+        else:
+            # s(t)=s0+sd t 跨过 0 和 1 的事件参数
+            cuts = [0.0, 1.0]
+            for s_edge in (0.0, 1.0):
+                t_cut = (s_edge - s0) / sd
+                if EPS < t_cut < 1.0 - EPS:
+                    cuts.append(t_cut)
+            cuts.sort()
+
+            def quad_for(lo: float, hi: float) -> tuple[float, float, float]:
+                t_mid = (lo + hi) * 0.5
+                s_mid = s0 + sd * t_mid
+                if -EPS <= s_mid <= 1.0 + EPS:
+                    w0 = (ap[0] - s0 * ab[0], ap[1] - s0 * ab[1])
+                    wd = (d[0] - sd * ab[0], d[1] - sd * ab[1])
+                    return (dot2(wd, wd),
+                            2.0 * (w0[0] * wd[0] + w0[1] * wd[1]),
+                            dot2(w0, w0))
+                e = a if s_mid < 0.0 else b
+                ex, ey = p0[0] - e[0], p0[1] - e[1]
+                return (dot2(d, d),
+                        2.0 * (d[0] * ex + d[1] * ey), ex * ex + ey * ey)
+
+            for k in range(len(cuts) - 1):
+                lo, hi = cuts[k], cuts[k + 1]
+                q2, q1, q0 = quad_for(lo, hi)
+                pieces.append((lo, hi, q2, q1, q0))
+
+    # 逐段求与 window 交集内的最小值：凸二次顶点 + 交区间端点
+    best_d = math.inf
+    best_t: float | None = None
+
+    def consider(t: float, q2: float, q1: float, q0: float) -> None:
+        nonlocal best_d, best_t
+        v = q2 * t * t + q1 * t + q0
+        v = max(0.0, v)
+        dv = math.sqrt(v)
+        if best_t is None or dv < best_d - EPS or \
+                (abs(dv - best_d) <= EPS and t < best_t):
+            best_d, best_t = dv, t
+
+    for lo, hi, q2, q1, q0 in pieces:
+        for wlo, whi in window:
+            clo = max(lo, wlo)
+            chi = min(hi, whi)
+            if clo > chi + EPS:
+                continue
+            clo = max(0.0, clo)
+            chi = min(1.0, chi)
+            if clo > chi + EPS:
+                continue
+            consider(clo, q2, q1, q0)
+            consider(chi, q2, q1, q0)
+            if q2 > EPS * EPS:
+                tv = -q1 / (2.0 * q2)
+                if clo + EPS < tv < chi - EPS:
+                    consider(tv, q2, q1, q0)
+    if best_t is None:
+        return None
+    return best_d, best_t
+
+
+def _line_closest(m: Motion, zone: Zone) -> tuple[float, float] | None:
+    """直线运动对单禁区：仅在 Z 窗口部分，返回 (最小原始距离, t)。"""
+    zwin = _z_window(m, zone)
+    if not zwin:
+        return None
+    p0 = (m.start[0], m.start[1])
+    p1 = (m.end[0], m.end[1])
+    if dot2((p1[0] - p0[0], p1[1] - p0[1]),
+            (p1[0] - p0[0], p1[1] - p0[1])) <= EPS * EPS:
+        # XY 静止：窗口内全程为同一点，取最早进入高度范围的进度
+        return point_polygon_distance(p0, zone.polygon), zwin[0][0]
+
+    # Z 窗口内有路径位于填充多边形内部/边界 => 距离 0；
+    # 内部区间内最早点即该段最小值点（贴合 _line_earliest 的覆盖口径）。
+    inside = _intersect(_merge(
+        list(_line_inside_intervals(p0, p1, zone.polygon))
+        + _vertex_passthrough_events(p0, p1, zone.polygon)
+        + _segment_overlap_events(p0, p1, zone.polygon)),
+        _merge(zwin))
+    if inside:
+        return 0.0, min(a for a, _ in inside)
+
+    best_d = math.inf
+    best_t = 1.0
+    poly = zone.polygon
+    n = len(poly)
+    for i in range(n):
+        found = _line_edge_closest(p0, p1, poly[i], poly[(i + 1) % n], zwin)
+        if found is None:
+            continue
+        dv, t = found
+        if dv < best_d - EPS or (abs(dv - best_d) <= EPS and t < best_t):
+            best_d, best_t = dv, t
+    return best_d, best_t
+
+
+def _arc_closest(m: Motion, zone: Zone) -> tuple[float, float] | None:
+    """圆弧运动对单禁区：仅在 Z 窗口（恒定 Z）部分，返回 (距离, s)。"""
+    zwin = _z_window(m, zone)
+    if not zwin:
+        return None
+    return arc_polygon_closest(m.center, m.radius, m.theta0, m.sweep,
+                               zone.polygon)
+
+
+def minimum_clearance(motions: list[Motion], zones: list[Zone],
+                      tool_radius: float,
+                      start: tuple[float, float, float]) -> ClearancePoint | None:
+    """全程最小水平净间隙。
+
+    对每段运动、每个禁区，仅在刀尖 Z 处于该禁区闭合高度范围的部分求连续 XY
+    路径到填充多边形的最小距离，再减刀具半径；直线、圆弧、整圆及中途进入
+    高度范围均覆盖。等值时按运动顺序、段内进度、禁区编号选取。
+    全程（含无运动段时的初始刀位）均不在任何禁区高度内时返回 None。
+    """
+    best: ClearancePoint | None = None
+
+    if not motions:
+        px, py, pz = start
+        for zone in zones:  # 已按 zone_no 排序
+            if not (zone.z_min - EPS <= pz <= zone.z_max + EPS):
+                continue
+            d = point_polygon_distance((px, py), zone.polygon)
+            cp = ClearancePoint(_snap_net(d, tool_radius), None, 0, 0.0,
+                                zone.zone_no, (float(px), float(py), float(pz)))
+            if _clearance_better(cp, best):
+                best = cp
+        return best
+
+    for order, m in enumerate(motions):
+        for zone in zones:
+            if m.kind == "line":
+                found = _line_closest(m, zone)
+            else:
+                found = _arc_closest(m, zone)
+            if found is None:
+                continue
+            d, prog = found
+            prog = max(0.0, min(1.0, prog))
+            if m.kind == "line":
+                x = m.start[0] + (m.end[0] - m.start[0]) * prog
+                y = m.start[1] + (m.end[1] - m.start[1]) * prog
+                z = _z_at(m, prog)
+            else:
+                theta = m.theta0 + m.sweep * prog
+                x = m.center[0] + m.radius * math.cos(theta)
+                y = m.center[1] + m.radius * math.sin(theta)
+                z = m.start[2]
+            cp = ClearancePoint(_snap_net(d, tool_radius), m.line_no, order,
+                                prog, zone.zone_no, (x, y, z))
+            if _clearance_better(cp, best):
+                best = cp
+    return best

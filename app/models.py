@@ -67,3 +67,9 @@ class Report(Base):
     collision_line_no = Column(Integer, nullable=True)
     collision_zone_no = Column(Integer, nullable=True)
     conclusion = Column(Text, nullable=False)
+
+    # 可选的全程最小水平净间隙（仅 include_min_clearance=true 的报告固化）
+    min_clearance_enabled = Column(Boolean, nullable=False, default=False,
+                                   server_default="0")
+    # {min_clearance_mm, line_no, point_mm, zone_no, progress} 或 None
+    min_clearance = Column(JSON, nullable=True)

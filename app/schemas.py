@@ -85,6 +85,16 @@ class ReviewRequest(BaseModel):
     start: tuple[float, float, float]
     tool_radius: float = Field(ge=0.0)
     gcode: str = Field(min_length=1)
+    # 可选：启用后计算全程最小水平净间隙并随报告固化
+    include_min_clearance: bool = False
+
+    @field_validator("include_min_clearance", mode="before")
+    @classmethod
+    def _strict_bool(cls, v):
+        # 仅接受真正的布尔值；拒绝 "true"/1 等隐式转换，属非法输入（422）
+        if not isinstance(v, bool):
+            raise ValueError("include_min_clearance 必须为布尔值 true/false")
+        return v
 
     @field_validator("tool_radius")
     @classmethod
@@ -101,6 +111,15 @@ class ReviewRequest(BaseModel):
         return tuple(float(c) for c in v)  # type: ignore[return-value]
 
 
+class MinClearanceOut(BaseModel):
+    """全程最小水平净间隙结果（毫米；净间隙可为负）。"""
+    min_clearance_mm: float
+    line_no: int | None
+    point_mm: tuple[float, float, float]
+    zone_no: int
+    progress: float = Field(description="取得最小值处的段内进度（直线 t / 圆弧 s）")
+
+
 class ReviewResponse(BaseModel):
     report_id: int
     used_zone_versions: dict[str, int]
@@ -110,3 +129,6 @@ class ReviewResponse(BaseModel):
     collision_zone_no: int | None
     conclusion: Literal["collision", "no_collision"]
     message: str
+    # 仅当请求 include_min_clearance=true 时非空；全程不在任何禁区高度内时为 null
+    min_clearance: MinClearanceOut | None = None
+    min_clearance_enabled: bool = False

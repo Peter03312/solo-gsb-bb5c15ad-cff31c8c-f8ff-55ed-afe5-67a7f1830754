@@ -75,6 +75,33 @@ def main() -> None:
     print("immutable old report:", old_report["used_zone_versions"],
           old_report["has_collision"])
 
+    # 6. 可选：启用全程最小水平净间隙（沿用既有审查输入）
+    #    路径 y=11 与方块上边 y=10 距离 1mm，刀半径 0.5 => 净间隙 0.5mm
+    clr = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 11.0, 0.0],
+        "tool_radius": 0.5,
+        "gcode": "G1 X15 Y11 Z0\n",
+        "include_min_clearance": True,
+    })
+    clr.raise_for_status()
+    body = clr.json()
+    mc = body["min_clearance"]
+    print("min clearance:", mc)
+    assert mc["min_clearance_mm"] == 0.5
+    # 结果随报告固化：GET /reports/{id} 与提交响应一致
+    assert c.get(f"/reports/{body['report_id']}").json()["min_clearance"] == mc
+
+    # 7. 未启用时字段为 null（旧请求/旧客户端完全兼容）
+    legacy = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 11.0, 0.0],
+        "tool_radius": 0.5,
+        "gcode": "G1 X15 Y11 Z0\n",
+    }).json()
+    assert legacy["min_clearance"] is None
+    print("legacy compatible: min_clearance =", legacy["min_clearance"])
+
 
 if __name__ == "__main__":
     main()

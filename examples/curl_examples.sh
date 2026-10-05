@@ -73,3 +73,26 @@ curl -s -X POST "$BASE/reviews" \
 
 echo "== 8) 旧报告内容不随后续禁区更新改变 =="
 curl -s "$BASE/reports/1"; echo
+
+echo "== 9) 可选：启用全程最小水平净间隙计算（include_min_clearance=true） =="
+# 先把禁区恢复为版本 1 风格（如已执行第 6 步，可显式引用 v1）；
+# 路径 y=11 与方块边 y=10 距离 1mm，刀半径 0.5 => 最小净间隙 0.5mm
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 11, 0],
+        "tool_radius": 0.5,
+        "gcode": "G1 X15 Y11 Z0\n",
+        "include_min_clearance": true
+      }'; echo
+
+echo "== 10) 未启用最小净间隙的请求：min_clearance 为 null，旧调用完全兼容 =="
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 11, 0],
+        "tool_radius": 0.5,
+        "gcode": "G1 X15 Y11 Z0\n"
+      }'; echo

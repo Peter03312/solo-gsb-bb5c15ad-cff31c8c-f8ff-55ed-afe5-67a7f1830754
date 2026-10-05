@@ -3,23 +3,24 @@ from __future__ import annotations
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import Session
 
-from .collision import Zone, check_path, initial_collision
+from .collision import Zone, check_path, initial_collision, minimum_clearance
 from .database import Base, engine, get_db
 from .gcode import GCodeError, parse_gcode
 from .geometry import GeometryError, normalize_polygon, validate_z_range
 from . import models
 from .models import Report, ZoneVersion
-from .schemas import (ReviewRequest, ReviewResponse, ZoneCreate, ZoneDetailOut,
-                      ZoneOut, ZoneVersionCreate, ZoneVersionOut)
+from .schemas import (MinClearanceOut, ReviewRequest, ReviewResponse, ZoneCreate,
+                      ZoneDetailOut, ZoneOut, ZoneVersionCreate, ZoneVersionOut)
 
 app = FastAPI(
     title="数控刀路禁入区审查服务",
-    version="1.0.0",
+    version="1.1.0",
     description="登记毫米制二维多边形禁区（含闭合 Z 高度范围、不可变版本），"
-                "对 G-code 刀路做连续碰撞审查并出具不可变报告。",
+                "对 G-code 刀路做连续碰撞审查并出具不可变报告；"
+                "可选计算全程最小水平净间隙（include_min_clearance）。",
 )
 
 
@@ -27,6 +28,30 @@ app = FastAPI(
 def on_startup() -> None:
     # 容器内由应用直接完成数据库初始化（表结构创建）
     Base.metadata.create_all(bind=engine)
+    # 旧库（v1.0）reports 表没有最小净间隙列：幂等补齐，保证旧请求/旧报告仍可读写
+    _ensure_report_columns(engine)
+
+
+def _ensure_report_columns(db_engine) -> None:
+    """对旧数据库幂等添加 reports.min_clearance(_enabled) 列。
+
+    PostgreSQL 支持 BOOLEAN/JSON 原生类型；SQLite 对列类型仅按名称亲和处理，
+    同名 DDL 同样可用。
+    """
+    inspector = inspect(db_engine)
+    if "reports" not in inspector.get_table_names():
+        return
+    existing = {c["name"] for c in inspector.get_columns("reports")}
+    is_pg = db_engine.dialect.name == "postgresql"
+    with db_engine.begin() as conn:
+        if "min_clearance_enabled" not in existing:
+            default = "FALSE" if is_pg else "0"
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN "
+                f"min_clearance_enabled BOOLEAN NOT NULL DEFAULT {default}"))
+        if "min_clearance" not in existing:
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN min_clearance JSON"))
 
 
 @app.exception_handler(GeometryError)
@@ -187,9 +212,15 @@ def review(payload: ReviewRequest,
         "tool_radius_mm": payload.tool_radius,
         "final_position_mm": list(parsed.final_position),
         "gcode_sha256": __sha(payload.gcode),
+        "include_min_clearance": bool(payload.include_min_clearance),
     }
 
     collision = check_path(parsed.motions, zones, payload.tool_radius)
+
+    # 可选：全程最小水平净间隙（不影响首碰撞结论/行号）
+    min_clr = minimum_clearance(parsed.motions, zones, payload.tool_radius,
+                                tuple(payload.start)) \
+        if payload.include_min_clearance else None
 
     line_no: int | None = None
     zone_no: int | None = None
@@ -216,6 +247,16 @@ def review(payload: ReviewRequest,
         conclusion = "no_collision"
         message = "刀路与全部指定禁区版本无碰撞"
 
+    clearance_payload: dict | None = None
+    if payload.include_min_clearance and min_clr is not None:
+        clearance_payload = {
+            "min_clearance_mm": min_clr.net,
+            "line_no": min_clr.line_no,
+            "point_mm": list(min_clr.point),
+            "zone_no": min_clr.zone_no,
+            "progress": min_clr.progress,
+        }
+
     report = Report(
         zone_versions=used_versions,
         input_summary=summary,
@@ -223,6 +264,8 @@ def review(payload: ReviewRequest,
         collision_line_no=line_no,
         collision_zone_no=zone_no,
         conclusion=conclusion,
+        min_clearance_enabled=bool(payload.include_min_clearance),
+        min_clearance=clearance_payload,
     )
     db.add(report)
     db.commit()
@@ -232,7 +275,10 @@ def review(payload: ReviewRequest,
         report_id=report.id, used_zone_versions=used_versions,
         input_summary=summary, has_collision=has_coll,
         collision_line_no=line_no, collision_zone_no=zone_no,
-        conclusion=conclusion, message=message)
+        conclusion=conclusion, message=message,
+        min_clearance=MinClearanceOut(**clearance_payload)
+        if clearance_payload is not None else None,
+        min_clearance_enabled=bool(payload.include_min_clearance))
 
 
 @app.get("/reports/{report_id}", summary="查询不可变审查报告")
@@ -255,6 +301,9 @@ def get_report(report_id: int, db: Session = Depends(get_db)) -> dict:
             if report.has_collision and report.collision_line_no is not None
             else ("初始刀位点位于禁区范围内" if report.has_collision
                   else "刀路与全部指定禁区版本无碰撞")),
+        # 固化的可选最小净间隙：未启用的旧报告不含/为空，查询保持一致
+        "min_clearance": report.min_clearance,
+        "min_clearance_enabled": bool(report.min_clearance_enabled),
     }
 
 
